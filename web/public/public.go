@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,6 +34,14 @@ const (
 	DistDir   = "dist"       // 静态资源存放目录
 	IndexFile = "index.html" // 相对于 DistDir
 )
+
+// Third-party themes are served from the site root, so a service worker with
+// scope "/" can also take control of /admin and /terminal. Remove stale root
+// registrations when a third-party theme is active. New registrations are
+// rejected server-side in the SPA handler below.
+const thirdPartyThemeServiceWorkerCleanup = `<script id="komari-theme-sw-cleanup">
+(()=>{if(!("serviceWorker" in navigator))return;const key="komari-theme-sw-cleanup-reloaded";navigator.serviceWorker.getRegistrations().then(async(registrations)=>{const rootRegistrations=registrations.filter((registration)=>{try{return new URL(registration.scope).pathname==="/"}catch{return false}});if(rootRegistrations.length===0){try{sessionStorage.removeItem(key)}catch{}return}await Promise.all(rootRegistrations.map((registration)=>registration.unregister()));if(navigator.serviceWorker.controller){let reloaded=false;try{reloaded=sessionStorage.getItem(key)==="1";if(!reloaded)sessionStorage.setItem(key,"1")}catch{}if(!reloaded){location.reload();return}}try{sessionStorage.removeItem(key)}catch{}}).catch(()=>{});})();
+</script>`
 
 func init() {
 	_ = os.MkdirAll("./data/theme", 0755)
@@ -86,6 +95,50 @@ func replaceHTMLLanguage(htmlStr, language string) string {
 
 func stripServiceWorkerRegistration(html string) string {
 	return strings.ReplaceAll(html, `<script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script>`, "")
+}
+
+func protectThirdPartyThemeHTML(html string) string {
+	html = stripServiceWorkerRegistration(html)
+	if strings.Contains(html, `id="komari-theme-sw-cleanup"`) {
+		return html
+	}
+	if strings.Contains(html, "</head>") {
+		return strings.Replace(html, "</head>", thirdPartyThemeServiceWorkerCleanup+"</head>", 1)
+	}
+	return thirdPartyThemeServiceWorkerCleanup + html
+}
+
+func isProtectedFrontendPath(requestPath string) bool {
+	return requestPath == "/admin" || strings.HasPrefix(requestPath, "/admin/") ||
+		requestPath == "/terminal" || strings.HasPrefix(requestPath, "/terminal/")
+}
+
+func isProtectedFrontendRequest(c *gin.Context) bool {
+	if isProtectedFrontendPath(c.Request.URL.Path) {
+		return true
+	}
+
+	referer := c.Request.Referer()
+	if referer == "" {
+		return false
+	}
+	u, err := url.Parse(referer)
+	if err != nil {
+		return false
+	}
+	return isProtectedFrontendPath(u.Path)
+}
+
+func isServiceWorkerScriptRequest(c *gin.Context) bool {
+	return strings.EqualFold(strings.TrimSpace(c.GetHeader("Service-Worker")), "script")
+}
+
+func setDynamicHTMLHeaders(c *gin.Context) {
+	// The same URL can render a different installed theme. Caching index.html
+	// across a theme switch can leave the browser loading assets from two themes.
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 }
 
 // isSafePath 验证路径是否在指定的基础目录内，防止路径穿透攻击
@@ -205,9 +258,10 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 
 		currentTheme := cfg[config.ThemeKey].(string)
 		shouldReplace := true
+		protectedPage := forceDefaultTheme || isProtectedFrontendPath(reqPath)
 
-		// 特殊页面：强制使用 default 主题，且不进行内容替换
-		if forceDefaultTheme || strings.HasPrefix(reqPath, "/admin") || strings.HasPrefix(reqPath, "/terminal") {
+		// 管理后台、终端和受限启动页面始终使用内置 default 主题。
+		if protectedPage {
 			currentTheme = DefaultTheme
 			shouldReplace = false
 		}
@@ -222,12 +276,20 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 		}
 
 		htmlStr := string(content)
-		if forceDefaultTheme {
+		if protectedPage {
+			// Protected pages must not install a root-scoped service worker.
 			htmlStr = stripServiceWorkerRegistration(htmlStr)
+		} else if currentTheme != DefaultTheme {
+			// Third-party themes live at /, therefore their root service workers can
+			// otherwise intercept /admin. Remove known registrations and clean up
+			// stale root registrations left by older theme versions.
+			htmlStr = protectThirdPartyThemeHTML(htmlStr)
 		}
 		if language, err := c.Cookie(LanguageCookieName); err == nil {
 			htmlStr = replaceHTMLLanguage(htmlStr, language)
 		}
+
+		setDynamicHTMLHeaders(c)
 
 		// 如果不替换，保留系统内置页面内容，仅同步 html lang。
 		if !shouldReplace {
@@ -251,7 +313,7 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 	r.GET("/favicon.ico", func(c *gin.Context) {
 		// 优先：./data/favicon.ico
 		localFavicon := filepath.Join(DataDir, FaviconFile)
-		if !forceDefaultTheme {
+		if !forceDefaultTheme && !isProtectedFrontendRequest(c) {
 			if _, err := os.Stat(localFavicon); err == nil {
 				c.File(localFavicon)
 				return
@@ -263,7 +325,7 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 		cfg := getConfig()
 		themeFaviconPath := path.Join(DistDir, FaviconFile)
 		currentTheme := cfg[config.ThemeKey].(string)
-		if forceDefaultTheme {
+		if forceDefaultTheme || isProtectedFrontendRequest(c) {
 			currentTheme = DefaultTheme
 		}
 		content, mimeType, exists := getFileContent(currentTheme, themeFaviconPath)
@@ -336,14 +398,23 @@ func static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc), force
 					"",            // domain
 					false,         // secure
 					false,         // httpOnly
-				)
+			)
 			}
 		}()
 		reqPath := c.Request.URL.Path
 		cfg := getConfig()
 		currentTheme := cfg[config.ThemeKey].(string)
-		if forceDefaultTheme {
+		if forceDefaultTheme || isProtectedFrontendRequest(c) {
 			currentTheme = DefaultTheme
+		}
+
+		// A third-party theme served from / must not be allowed to install a
+		// root-scoped service worker, because that worker can intercept protected
+		// routes before the request reaches Komari's default-theme routing.
+		if currentTheme != DefaultTheme && isServiceWorkerScriptRequest(c) {
+			c.Header("Cache-Control", "no-store")
+			c.Status(http.StatusNotFound)
+			return
 		}
 
 		// SPA 静态资源回退

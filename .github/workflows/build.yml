@@ -7,6 +7,21 @@ on:
   workflow_dispatch:
 
 jobs:
+  test-public:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Test public frontend routing
+        run: go test ./web/public
+
   build-frontend:
     runs-on: ubuntu-latest
 
@@ -20,7 +35,7 @@ jobs:
           artifact-name: komari-frontend
 
   build-binaries:
-    needs: build-frontend
+    needs: [test-public, build-frontend]
     runs-on: ubuntu-latest
 
     strategy:
@@ -78,7 +93,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
 
       - name: Install Zig cross-compiler toolchain
         uses: ./.github/actions/setup-zig
