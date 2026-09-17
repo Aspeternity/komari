@@ -1,6 +1,6 @@
 package utils
 
 var (
-	CurrentVersion = "0.0.1"
+	CurrentVersion = "1.5.1-asp.1"
 	VersionHash    = "unknown"
 )

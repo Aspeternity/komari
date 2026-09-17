@@ -1,4 +1,4 @@
-name: Publish Docker Image on Main
+name: Publish Maintained Docker Image
 
 on:
   push:
@@ -16,7 +16,30 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve maintenance version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$VERSION" ]; then
+            echo "VERSION file is empty" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Maintenance version: $VERSION"
+
   build-frontend:
+    needs: prepare
     runs-on: ubuntu-latest
 
     steps:
@@ -29,7 +52,7 @@ jobs:
           artifact-name: komari-frontend
 
   build-docker-binaries:
-    needs: build-frontend
+    needs: [prepare, build-frontend]
     runs-on: ubuntu-latest
 
     steps:
@@ -52,10 +75,12 @@ jobs:
           GOOS: linux
           CGO_ENABLED: 1
           GIN_MODE: release
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          VERSION="${{ github.ref_name }}"
           VERSION_HASH="${{ github.sha }}"
           LDFLAGS="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}"
+
+          echo "Building Komari ${VERSION} (${VERSION_HASH})"
 
           echo "Building for linux/amd64..."
           GOARCH=amd64 CC="zig cc -target x86_64-linux-musl" go build -trimpath -ldflags="$LDFLAGS" -o komari-linux-amd64
@@ -70,7 +95,7 @@ jobs:
           path: komari-linux-*
 
   build-and-push-multi-arch:
-    needs: build-docker-binaries
+    needs: [prepare, build-docker-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -106,8 +131,13 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.prepare.outputs.version }}
             type=raw,value=${{ github.ref_name }}
             type=sha,format=short
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
