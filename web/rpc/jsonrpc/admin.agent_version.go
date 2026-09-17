@@ -79,6 +79,10 @@ func adminGetAgentReleaseStatus(_ context.Context, req *rpc.JsonRpcRequest) (any
 		if cached.LatestVersion != "" {
 			cached.Stale = true
 			cached.CheckError = err.Error()
+			cached.CheckedAt = now
+			agentReleaseCache.Lock()
+			agentReleaseCache.status = cached
+			agentReleaseCache.Unlock()
 			return cached, nil
 		}
 		return nil, rpc.MakeError(rpc.InternalError, "failed to check latest agent release: "+err.Error(), nil)
