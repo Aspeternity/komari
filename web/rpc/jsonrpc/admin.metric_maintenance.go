@@ -95,9 +95,9 @@ func adminCleanupTrafficHistoryAnomalies(ctx context.Context, req *rpc.JsonRpcRe
 
 	actor, ip := auditActor(ctx)
 	auditlog.Log(ip, actor, fmt.Sprintf(
-		"cleanup traffic history anomalies: threshold=%.0f matched=%d deleted=%d remaining=%d before=%s",
+		"cleanup traffic history anomalies: threshold=%.0f confirmed=%d deleted=%d remaining=%d before=%s",
 		report.ThresholdBytes,
-		report.MatchingBuckets,
+		params.ExpectedMatches,
 		report.DeletedBuckets,
 		report.RemainingBuckets,
 		report.SafeBefore.Format(time.RFC3339),
