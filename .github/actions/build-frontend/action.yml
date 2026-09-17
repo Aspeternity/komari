@@ -1,5 +1,5 @@
 name: Build frontend theme
-description: Clone komari-web, build the default theme, and optionally upload it as an artifact.
+description: Clone the maintained komari-web fork, build the default theme, and optionally upload it as an artifact.
 
 inputs:
   node-version:
@@ -7,10 +7,10 @@ inputs:
     default: "23"
   repository:
     description: komari-web repository URL.
-    default: https://github.com/komari-monitor/komari-web
+    default: https://github.com/Aspeternity/komari-web
   ref:
-    description: Optional komari-web ref to build. Uses the repository default branch when empty.
-    default: ""
+    description: komari-web ref used for production builds.
+    default: "stable"
   artifact-name:
     description: Optional artifact name for the packed frontend theme.
     default: ""
