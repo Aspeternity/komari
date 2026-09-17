@@ -12,8 +12,9 @@ on:
         required: true
         type: string
       frontend_ref:
-        description: komari-web commit, branch, or tag to build.
-        required: true
+        description: Maintained komari-web commit, branch, or tag to build.
+        required: false
+        default: stable
         type: string
 
 permissions:
@@ -32,7 +33,7 @@ jobs:
       - name: Checkout workflow source
         uses: actions/checkout@v4
 
-      - name: Build selected frontend artifact
+      - name: Build selected maintained frontend artifact
         uses: ./.github/actions/build-frontend
         with:
           artifact-name: komari-frontend
@@ -80,16 +81,16 @@ jobs:
         with:
           ref: ${{ inputs.server_ref }}
 
-      - name: Restore frontend artifact
-        uses: komari-monitor/komari/.github/actions/restore-frontend@main
+      - name: Restore maintained frontend artifact
+        uses: Aspeternity/komari/.github/actions/restore-frontend@main
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23"
+          go-version: "1.25"
 
       - name: Install Zig cross-compiler toolchain
-        uses: komari-monitor/komari/.github/actions/setup-zig@main
+        uses: Aspeternity/komari/.github/actions/setup-zig@main
 
       - name: Build binary
         env:
@@ -155,5 +156,8 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.release_tag }}
+          labels: |
+            org.opencontainers.image.version=${{ inputs.release_tag }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
           no-cache: true
           provenance: false
