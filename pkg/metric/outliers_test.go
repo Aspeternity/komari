@@ -38,7 +38,7 @@ func TestRollupOutlierScanAndCleanup(t *testing.T) {
 	query := RollupOutlierQuery{
 		MetricNames:  []string{"traffic.up", "traffic.down"},
 		MinValue:     oneTiB,
-		Before:       now.Add(-15 * time.Minute),
+		Before:       s.RollupMaintenanceSafeBefore(now),
 		PreviewLimit: 10,
 	}
 	scan, err := s.FindRollupOutliers(ctx, query)
@@ -48,6 +48,9 @@ func TestRollupOutlierScanAndCleanup(t *testing.T) {
 	if scan.TotalMatches != 1 {
 		t.Fatalf("total matches = %d, want 1; preview=%#v", scan.TotalMatches, scan.Preview)
 	}
+	if scan.Fingerprint == "" {
+		t.Fatal("scan fingerprint is empty")
+	}
 	if len(scan.Preview) != 1 || scan.Preview[0].MetricName != "traffic.up" || scan.Preview[0].EntityID != "node-bad" {
 		t.Fatalf("preview = %#v, want node-bad traffic.up", scan.Preview)
 	}
@@ -55,7 +58,7 @@ func TestRollupOutlierScanAndCleanup(t *testing.T) {
 		t.Fatalf("affected entities = %#v, want [node-bad]", scan.AffectedEntities)
 	}
 
-	deleted, err := s.DeleteRollupOutliers(ctx, query, 100)
+	deleted, err := s.DeleteRollupOutliers(ctx, query, 100, scan.TotalMatches, scan.Fingerprint)
 	if err != nil {
 		t.Fatalf("delete outliers: %v", err)
 	}
@@ -114,16 +117,90 @@ func TestDeleteRollupOutliersHonorsBlastRadiusLimit(t *testing.T) {
 	query := RollupOutlierQuery{
 		MetricNames: []string{"traffic.up"},
 		MinValue:    oneTiB,
-		Before:      now.Add(-15 * time.Minute),
-	}
-	if _, err := s.DeleteRollupOutliers(ctx, query, 1); err == nil {
-		t.Fatal("cleanup unexpectedly succeeded despite maxDelete=1")
+		Before:      s.RollupMaintenanceSafeBefore(now),
 	}
 	scan, err := s.FindRollupOutliers(ctx, query)
 	if err != nil {
+		t.Fatalf("scan before limited cleanup: %v", err)
+	}
+	if _, err := s.DeleteRollupOutliers(ctx, query, 1, scan.TotalMatches, scan.Fingerprint); err == nil {
+		t.Fatal("cleanup unexpectedly succeeded despite maxDelete=1")
+	}
+	after, err := s.FindRollupOutliers(ctx, query)
+	if err != nil {
 		t.Fatalf("scan after rejected cleanup: %v", err)
 	}
-	if scan.TotalMatches != 2 {
-		t.Fatalf("matches after rejected cleanup = %d, want 2", scan.TotalMatches)
+	if after.TotalMatches != 2 {
+		t.Fatalf("matches after rejected cleanup = %d, want 2", after.TotalMatches)
+	}
+}
+
+func TestDeleteRollupOutliersRejectsSameCardinalityStalePreview(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, SQLite(":memory:", WithRollupPolicy(RollupPolicy{
+		RawRetention: time.Minute,
+		Tiers:        []RollupTier{{Interval: time.Minute, Retention: 24 * time.Hour}},
+		Compression:  30,
+	})))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+	if err := s.CreateMetric(ctx, Definition{Name: "traffic.up", Type: TypeGauge, RetentionDays: 1}); err != nil {
+		t.Fatalf("create metric: %v", err)
+	}
+
+	now := time.Now().UTC()
+	old := now.Add(-time.Hour).Truncate(time.Minute)
+	const oneTiB = float64(1 << 40)
+	if err := s.Write(ctx, Point{MetricName: "traffic.up", EntityID: "node-1", Timestamp: old.Add(5 * time.Second), Value: 2 * oneTiB}); err != nil {
+		t.Fatalf("write initial point: %v", err)
+	}
+	query := RollupOutlierQuery{MetricNames: []string{"traffic.up"}, MinValue: oneTiB, Before: s.RollupMaintenanceSafeBefore(now)}
+	scan, err := s.FindRollupOutliers(ctx, query)
+	if err != nil {
+		t.Fatalf("initial scan: %v", err)
+	}
+	if scan.TotalMatches != 1 {
+		t.Fatalf("initial matches = %d, want 1", scan.TotalMatches)
+	}
+
+	// Mutate the same persisted minute bucket. The number of matching buckets
+	// remains one, but the reviewed bucket contents are no longer identical.
+	if err := s.Write(ctx, Point{MetricName: "traffic.up", EntityID: "node-1", Timestamp: old.Add(15 * time.Second), Value: 3 * oneTiB}); err != nil {
+		t.Fatalf("write changed point: %v", err)
+	}
+	changed, err := s.FindRollupOutliers(ctx, query)
+	if err != nil {
+		t.Fatalf("scan changed bucket: %v", err)
+	}
+	if changed.TotalMatches != scan.TotalMatches {
+		t.Fatalf("changed cardinality = %d, want %d", changed.TotalMatches, scan.TotalMatches)
+	}
+	if changed.Fingerprint == scan.Fingerprint {
+		t.Fatal("fingerprint did not change after bucket contents changed")
+	}
+	if _, err := s.DeleteRollupOutliers(ctx, query, 100, scan.TotalMatches, scan.Fingerprint); err == nil {
+		t.Fatal("cleanup unexpectedly accepted stale same-cardinality preview")
+	}
+}
+
+func TestRollupMaintenanceSafeBeforeUsesLargestTier(t *testing.T) {
+	s, err := Open(context.Background(), SQLite(":memory:"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Date(2026, 9, 17, 21, 35, 0, 0, time.UTC)
+	safe := s.RollupMaintenanceSafeBefore(now)
+	if safe.Hour() != 0 || safe.Minute() != 0 || safe.Second() != 0 {
+		t.Fatalf("safe boundary = %s, want day-aligned boundary", safe)
+	}
+	if safe.After(now.Add(-coarseRollupGrace)) {
+		t.Fatalf("safe boundary = %s overlaps coarse rollup grace", safe)
+	}
+	if now.Sub(safe) > 24*time.Hour+coarseRollupGrace {
+		t.Fatalf("safe boundary = %s is more conservative than one max tier plus grace", safe)
 	}
 }
