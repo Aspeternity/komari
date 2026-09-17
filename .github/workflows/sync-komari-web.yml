@@ -1,0 +1,109 @@
+name: Sync Maintained Komari Web
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild even when the frontend revision has not changed
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-komari-web-stable
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      frontend_sha: ${{ steps.compare.outputs.frontend_sha }}
+
+    steps:
+      - name: Checkout Komari
+        uses: actions/checkout@v4
+
+      - name: Compare maintained frontend revision
+        id: compare
+        env:
+          FORCE_BUILD: ${{ inputs.force_build || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FRONTEND_REPOSITORY="https://github.com/Aspeternity/komari-web.git"
+          FRONTEND_REF="refs/heads/stable"
+          LOCK_FILE=".github/komari-web-stable.sha"
+
+          latest_sha="$(git ls-remote "$FRONTEND_REPOSITORY" "$FRONTEND_REF" | awk '{print $1}')"
+          if [ -z "$latest_sha" ]; then
+            echo "Unable to resolve Aspeternity/komari-web:stable" >&2
+            exit 1
+          fi
+
+          current_sha=""
+          if [ -f "$LOCK_FILE" ]; then
+            current_sha="$(tr -d '[:space:]' < "$LOCK_FILE")"
+          fi
+
+          echo "Current recorded frontend: ${current_sha:-<none>}"
+          echo "Latest stable frontend:   $latest_sha"
+
+          changed=false
+          if [ "$latest_sha" != "$current_sha" ] || [ "$FORCE_BUILD" = "true" ]; then
+            changed=true
+          fi
+
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "frontend_sha=$latest_sha" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    uses: ./.github/workflows/docker-publish.yml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+
+  record:
+    needs: [check, publish]
+    if: needs.check.outputs.changed == 'true' && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Record successfully published frontend revision
+        env:
+          FRONTEND_SHA: ${{ needs.check.outputs.frontend_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin main
+
+          printf '%s\n' "$FRONTEND_SHA" > .github/komari-web-stable.sha
+          git add .github/komari-web-stable.sha
+
+          if git diff --cached --quiet; then
+            echo "Frontend revision is already recorded."
+            exit 0
+          fi
+
+          git commit -m "chore: sync komari-web ${FRONTEND_SHA:0:12}"
+          git push origin HEAD:main
