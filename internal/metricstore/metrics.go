@@ -8,9 +8,12 @@ const (
 	MetricGPUMemTotal    = "gpu.memory.total"
 	MetricGPUTemp        = "gpu.temperature"
 	MetricRAM            = "memory.used"
+	MetricRAMTotal       = "memory.total"
 	MetricSwap           = "swap.used"
+	MetricSwapTotal      = "swap.total"
 	MetricLoad           = "load.average"
 	MetricDisk           = "disk.used"
+	MetricDiskTotal      = "disk.total"
 	MetricNetIn          = "net.in.rate"
 	MetricNetOut         = "net.out.rate"
 	MetricNetTotalUp     = "net.total.up"
@@ -32,13 +35,20 @@ var loadRecordMetricNames = []string{
 	MetricProcess, MetricConnections, MetricConnectionsUDP,
 }
 
+// systemCapacityMetricNames are persisted alongside the legacy-compatible
+// record metrics, but are not part of models.Record reconstruction because the
+// legacy record shape only carried used memory/swap/disk values.
+var systemCapacityMetricNames = []string{
+	MetricRAMTotal, MetricSwapTotal, MetricDiskTotal,
+}
+
 // gpuDeviceRecordMetricNames are stored separately from the entity-level GPU
 // average and are included when deleting all system records.
 var gpuDeviceRecordMetricNames = []string{
 	MetricGPUDeviceUsage, MetricGPUMem, MetricGPUMemTotal, MetricGPUTemp,
 }
 
-var recordMetricNames = joinMetricNames(loadRecordMetricNames, gpuDeviceRecordMetricNames)
+var recordMetricNames = joinMetricNames(loadRecordMetricNames, systemCapacityMetricNames, gpuDeviceRecordMetricNames)
 
 // Ping has an independent retention and cleanup boundary.
 var pingMetricNames = []string{MetricPingLatency, MetricPingLoss}

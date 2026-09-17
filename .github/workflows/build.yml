@@ -42,6 +42,9 @@ jobs:
       - name: Test public frontend routing
         run: go test ./web/public
 
+      - name: Test metric store regressions
+        run: go test ./internal/metricstore
+
   build-binaries:
     needs: [test-public, build-frontend]
     runs-on: ubuntu-latest

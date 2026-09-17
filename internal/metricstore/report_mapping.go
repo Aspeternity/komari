@@ -14,12 +14,16 @@ import (
 func reportMetricPoints(report v2.Report, trafficUp, trafficDown int64) []metric.Point {
 	entityID := report.UUID
 	ts := report.UpdatedAt
+	trafficUp, trafficDown = suppressTrafficOnUptimeRegression(report, trafficUp, trafficDown)
 	points := []metric.Point{
 		{MetricName: MetricCPU, EntityID: entityID, Timestamp: ts, Value: report.CPU.Usage},
 		{MetricName: MetricRAM, EntityID: entityID, Timestamp: ts, Value: float64(report.Ram.Used)},
+		{MetricName: MetricRAMTotal, EntityID: entityID, Timestamp: ts, Value: float64(report.Ram.Total)},
 		{MetricName: MetricSwap, EntityID: entityID, Timestamp: ts, Value: float64(report.Swap.Used)},
+		{MetricName: MetricSwapTotal, EntityID: entityID, Timestamp: ts, Value: float64(report.Swap.Total)},
 		{MetricName: MetricLoad, EntityID: entityID, Timestamp: ts, Value: report.Load.Load1},
 		{MetricName: MetricDisk, EntityID: entityID, Timestamp: ts, Value: float64(report.Disk.Used)},
+		{MetricName: MetricDiskTotal, EntityID: entityID, Timestamp: ts, Value: float64(report.Disk.Total)},
 		{MetricName: MetricNetIn, EntityID: entityID, Timestamp: ts, Value: float64(report.Network.Down)},
 		{MetricName: MetricNetOut, EntityID: entityID, Timestamp: ts, Value: float64(report.Network.Up)},
 		{MetricName: MetricNetTotalUp, EntityID: entityID, Timestamp: ts, Value: float64(report.Network.TotalUp)},
@@ -117,6 +121,7 @@ func TrafficCounterDelta(current, previous int64) int64 {
 
 func deleteReportTrafficState(entityID string) {
 	reportTrafficStates.Delete(entityID)
+	deleteReportUptimeState(entityID)
 }
 
 func clearReportTrafficStates() {
@@ -124,4 +129,5 @@ func clearReportTrafficStates() {
 		reportTrafficStates.Delete(key)
 		return true
 	})
+	clearReportUptimeStates()
 }
