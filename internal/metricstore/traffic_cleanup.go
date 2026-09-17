@@ -3,6 +3,7 @@ package metricstore
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/komari-monitor/komari/pkg/metric"
@@ -17,7 +18,6 @@ const (
 	DefaultTrafficAnomalyPreviewLimit   = 100
 	MaxTrafficAnomalyPreviewLimit       = 500
 	MaxTrafficAnomalyCleanupBuckets     = 10000
-	trafficHistoryStableDelay           = 15 * time.Minute
 )
 
 // TrafficHistoryMaintenanceReport is returned by both preview and cleanup.
@@ -28,13 +28,10 @@ type TrafficHistoryMaintenanceReport struct {
 	AffectedEntities   []string               `json:"affected_entities"`
 	Preview            []metric.RollupOutlier `json:"preview"`
 	Truncated          bool                   `json:"truncated"`
+	Fingerprint        string                 `json:"fingerprint"`
 	DeletedBuckets     int64                  `json:"deleted_buckets,omitempty"`
 	RemainingBuckets   int64                  `json:"remaining_buckets,omitempty"`
 	CleanupLimit       int                    `json:"cleanup_limit"`
-}
-
-func trafficHistorySafeBefore(now time.Time) time.Time {
-	return now.UTC().Add(-trafficHistoryStableDelay).Truncate(time.Minute)
 }
 
 func normalizeTrafficAnomalyThreshold(value float64) (float64, error) {
@@ -57,14 +54,14 @@ func normalizeTrafficAnomalyPreviewLimit(limit int) int {
 	return limit
 }
 
-func normalizeTrafficHistoryBefore(requested, now time.Time) (time.Time, error) {
-	safe := trafficHistorySafeBefore(now)
+func normalizeTrafficHistoryBefore(requested, safe time.Time) (time.Time, error) {
+	safe = safe.UTC()
 	if requested.IsZero() {
 		return safe, nil
 	}
 	requested = requested.UTC()
 	if requested.After(safe) {
-		return time.Time{}, fmt.Errorf("requested cleanup boundary %s overlaps mutable metric history; latest safe boundary is %s", requested.Format(time.RFC3339), safe.Format(time.RFC3339))
+		return time.Time{}, fmt.Errorf("requested cleanup boundary %s overlaps mutable rollup history; latest fully sealed boundary is %s", requested.Format(time.RFC3339), safe.Format(time.RFC3339))
 	}
 	return requested, nil
 }
@@ -79,13 +76,11 @@ func trafficOutlierQuery(threshold float64, before time.Time, previewLimit int) 
 }
 
 // ScanTrafficHistoryAnomalies performs a read-only dry-run over persisted
-// traffic rollups. It never removes data.
+// traffic rollups. It never removes data. The safe boundary is derived from
+// the largest configured rollup tier, so a matching minute cannot still be
+// retained inside an in-memory 5m/hour/day parent waiting to be persisted.
 func ScanTrafficHistoryAnomalies(ctx context.Context, threshold float64, before time.Time, previewLimit int) (TrafficHistoryMaintenanceReport, error) {
 	threshold, err := normalizeTrafficAnomalyThreshold(threshold)
-	if err != nil {
-		return TrafficHistoryMaintenanceReport{}, err
-	}
-	before, err = normalizeTrafficHistoryBefore(before, time.Now().UTC())
 	if err != nil {
 		return TrafficHistoryMaintenanceReport{}, err
 	}
@@ -98,6 +93,10 @@ func ScanTrafficHistoryAnomalies(ctx context.Context, threshold float64, before 
 	store := GetStore()
 	if store == nil {
 		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("metric store not initialized")
+	}
+	before, err = normalizeTrafficHistoryBefore(before, store.RollupMaintenanceSafeBefore(time.Now().UTC()))
+	if err != nil {
+		return TrafficHistoryMaintenanceReport{}, err
 	}
 
 	scan, err := store.FindRollupOutliers(ctx, trafficOutlierQuery(threshold, before, previewLimit))
@@ -111,26 +110,26 @@ func ScanTrafficHistoryAnomalies(ctx context.Context, threshold float64, before 
 		AffectedEntities: scan.AffectedEntities,
 		Preview:          scan.Preview,
 		Truncated:        scan.Truncated,
+		Fingerprint:      scan.Fingerprint,
 		CleanupLimit:     MaxTrafficAnomalyCleanupBuckets,
 	}, nil
 }
 
 // CleanupTrafficHistoryAnomalies removes only persisted traffic rollup buckets
-// that match an already previewed threshold and safety boundary. expectedMatches
-// makes the operation fail closed if the data changed between preview and
-// confirmation.
-func CleanupTrafficHistoryAnomalies(ctx context.Context, threshold float64, before time.Time, previewLimit int, expectedMatches int64) (TrafficHistoryMaintenanceReport, error) {
+// matched by an already reviewed preview. The expected count and fingerprint
+// are both revalidated inside the deletion transaction, so a same-cardinality
+// but different candidate set is also rejected.
+func CleanupTrafficHistoryAnomalies(ctx context.Context, threshold float64, before time.Time, previewLimit int, expectedMatches int64, expectedFingerprint string) (TrafficHistoryMaintenanceReport, error) {
 	if before.IsZero() {
 		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("safe_before from a completed preview is required")
 	}
 	if expectedMatches < 0 {
 		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("expected_matches cannot be negative")
 	}
-	threshold, err := normalizeTrafficAnomalyThreshold(threshold)
-	if err != nil {
-		return TrafficHistoryMaintenanceReport{}, err
+	if strings.TrimSpace(expectedFingerprint) == "" {
+		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("expected_fingerprint from a completed preview is required")
 	}
-	before, err = normalizeTrafficHistoryBefore(before, time.Now().UTC())
+	threshold, err := normalizeTrafficAnomalyThreshold(threshold)
 	if err != nil {
 		return TrafficHistoryMaintenanceReport{}, err
 	}
@@ -144,20 +143,22 @@ func CleanupTrafficHistoryAnomalies(ctx context.Context, threshold float64, befo
 	if store == nil {
 		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("metric store not initialized")
 	}
-
-	query := trafficOutlierQuery(threshold, before, previewLimit)
-	scan, err := store.FindRollupOutliers(ctx, query)
+	before, err = normalizeTrafficHistoryBefore(before, store.RollupMaintenanceSafeBefore(time.Now().UTC()))
 	if err != nil {
 		return TrafficHistoryMaintenanceReport{}, err
 	}
-	if scan.TotalMatches != expectedMatches {
-		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("traffic anomaly set changed after preview: expected %d buckets, found %d; scan again before cleanup", expectedMatches, scan.TotalMatches)
-	}
-	if scan.TotalMatches > MaxTrafficAnomalyCleanupBuckets {
-		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("refusing to delete %d buckets in one operation; safety limit is %d", scan.TotalMatches, MaxTrafficAnomalyCleanupBuckets)
-	}
 
-	deleted, err := store.DeleteRollupOutliers(ctx, query, MaxTrafficAnomalyCleanupBuckets)
+	query := trafficOutlierQuery(threshold, before, previewLimit)
+	if expectedMatches > MaxTrafficAnomalyCleanupBuckets {
+		return TrafficHistoryMaintenanceReport{}, fmt.Errorf("refusing to delete %d buckets in one operation; safety limit is %d", expectedMatches, MaxTrafficAnomalyCleanupBuckets)
+	}
+	deleted, err := store.DeleteRollupOutliers(
+		ctx,
+		query,
+		MaxTrafficAnomalyCleanupBuckets,
+		expectedMatches,
+		expectedFingerprint,
+	)
 	if err != nil {
 		return TrafficHistoryMaintenanceReport{}, err
 	}
@@ -166,14 +167,15 @@ func CleanupTrafficHistoryAnomalies(ctx context.Context, threshold float64, befo
 		return TrafficHistoryMaintenanceReport{}, err
 	}
 	return TrafficHistoryMaintenanceReport{
-		ThresholdBytes:   threshold,
-		SafeBefore:       before,
-		MatchingBuckets:  scan.TotalMatches,
-		AffectedEntities: scan.AffectedEntities,
-		Preview:          scan.Preview,
-		Truncated:        scan.Truncated,
-		DeletedBuckets:   deleted,
-		RemainingBuckets: remaining.TotalMatches,
-		CleanupLimit:     MaxTrafficAnomalyCleanupBuckets,
+		ThresholdBytes:     threshold,
+		SafeBefore:         before,
+		MatchingBuckets:    expectedMatches,
+		AffectedEntities:   remaining.AffectedEntities,
+		Preview:            remaining.Preview,
+		Truncated:          remaining.Truncated,
+		Fingerprint:        remaining.Fingerprint,
+		DeletedBuckets:     deleted,
+		RemainingBuckets:   remaining.TotalMatches,
+		CleanupLimit:       MaxTrafficAnomalyCleanupBuckets,
 	}, nil
 }
