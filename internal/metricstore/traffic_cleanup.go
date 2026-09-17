@@ -169,7 +169,7 @@ func CleanupTrafficHistoryAnomalies(ctx context.Context, threshold float64, befo
 	return TrafficHistoryMaintenanceReport{
 		ThresholdBytes:     threshold,
 		SafeBefore:         before,
-		MatchingBuckets:    expectedMatches,
+		MatchingBuckets:    remaining.TotalMatches,
 		AffectedEntities:   remaining.AffectedEntities,
 		Preview:            remaining.Preview,
 		Truncated:          remaining.Truncated,
