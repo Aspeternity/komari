@@ -2,6 +2,28 @@
 
 All notable changes in the Aspeternity-maintained fork are documented here.
 
+## 1.5.1-asp.3 - 2026-09-17
+
+### Added
+
+- Added administrator-controlled historical anomaly scanning for persisted `traffic.up` and `traffic.down` rollups.
+- Added a read-only preview that reports affected servers, exact rollup bucket count, fully sealed cleanup boundary, and bounded anomaly samples before any data can be removed.
+- Added a guarded cleanup operation that deletes only contaminated historical rollup buckets while leaving cumulative `net.total.up` / `net.total.down` counters untouched.
+
+### Safety
+
+- Detects anomalies using each rollup bucket's `max_val` rather than aggregate `sum`, so legitimately large long-window traffic totals are not mistaken for one impossible report.
+- Defaults to a conservative 1 TiB per-report threshold and enforces a 64 GiB minimum threshold.
+- Derives the cleanup boundary from the largest configured rollup tier plus its sealing grace period, preventing an anomaly still present in an in-memory 5-minute/hour/day parent from being written back after cleanup.
+- Requires explicit confirmation plus the preview's exact boundary, expected match count, and SHA-256 candidate-set fingerprint; any stale or changed preview fails closed and must be scanned again.
+- Refuses a single cleanup operation above 10,000 persisted buckets.
+- Records both preview and cleanup activity in the audit log.
+
+### Maintenance
+
+- Added storage-engine regression tests covering anomaly detection, targeted deletion, unrelated-metric preservation, cleanup blast-radius refusal, fully sealed rollup boundaries, and same-cardinality stale-preview rejection.
+- Added `go test ./pkg/metric` to pull-request CI so persisted-rollup maintenance code is tested directly.
+
 ## 1.5.1-asp.2 - 2026-09-17
 
 ### Fixed

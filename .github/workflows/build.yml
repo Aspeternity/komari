@@ -45,6 +45,9 @@ jobs:
       - name: Test metric store regressions
         run: go test ./internal/metricstore
 
+      - name: Test metric storage engine
+        run: go test ./pkg/metric
+
   build-binaries:
     needs: [test-public, build-frontend]
     runs-on: ubuntu-latest
