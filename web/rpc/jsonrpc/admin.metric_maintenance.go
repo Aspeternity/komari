@@ -23,11 +23,12 @@ type trafficHistoryScanParams struct {
 }
 
 type trafficHistoryCleanupParams struct {
-	ThresholdBytes float64 `json:"threshold_bytes"`
-	SafeBefore     string  `json:"safe_before"`
-	PreviewLimit   int     `json:"preview_limit"`
-	ExpectedMatches int64  `json:"expected_matches"`
-	Confirm        bool    `json:"confirm"`
+	ThresholdBytes      float64 `json:"threshold_bytes"`
+	SafeBefore          string  `json:"safe_before"`
+	PreviewLimit        int     `json:"preview_limit"`
+	ExpectedMatches     int64   `json:"expected_matches"`
+	ExpectedFingerprint string  `json:"expected_fingerprint"`
+	Confirm             bool    `json:"confirm"`
 }
 
 func parseTrafficHistoryBoundary(raw string) (time.Time, error) {
@@ -57,7 +58,7 @@ func adminScanTrafficHistoryAnomalies(ctx context.Context, req *rpc.JsonRpcReque
 	}
 
 	actor, ip := auditActor(ctx)
-	auditlog.Log(ip, actor, fmt.Sprintf("preview traffic history anomalies: threshold=%.0f matches=%d", report.ThresholdBytes, report.MatchingBuckets), "info")
+	auditlog.Log(ip, actor, fmt.Sprintf("preview traffic history anomalies: threshold=%.0f matches=%d before=%s", report.ThresholdBytes, report.MatchingBuckets, report.SafeBefore.Format(time.RFC3339)), "info")
 	return report, nil
 }
 
@@ -68,6 +69,9 @@ func adminCleanupTrafficHistoryAnomalies(ctx context.Context, req *rpc.JsonRpcRe
 	}
 	if !params.Confirm {
 		return nil, rpc.MakeError(rpc.InvalidParams, "confirm=true is required after reviewing a preview", nil)
+	}
+	if strings.TrimSpace(params.ExpectedFingerprint) == "" {
+		return nil, rpc.MakeError(rpc.InvalidParams, "expected_fingerprint from the preview is required", nil)
 	}
 	before, err := parseTrafficHistoryBoundary(params.SafeBefore)
 	if err != nil {
@@ -83,6 +87,7 @@ func adminCleanupTrafficHistoryAnomalies(ctx context.Context, req *rpc.JsonRpcRe
 		before,
 		params.PreviewLimit,
 		params.ExpectedMatches,
+		params.ExpectedFingerprint,
 	)
 	if err != nil {
 		return nil, rpc.MakeError(rpc.InvalidParams, "Failed to clean traffic history: "+err.Error(), nil)
