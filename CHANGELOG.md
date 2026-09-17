@@ -2,6 +2,26 @@
 
 All notable changes in the Aspeternity-maintained fork are documented here.
 
+## 1.5.1-asp.4 - 2026-09-17
+
+### Added
+
+- Added administrator-facing Agent version management backed by each node's existing reported `version` field.
+- Added a cached server-side check for the latest stable `komari-monitor/komari-agent` GitHub release, with manual refresh and stale-cache fallback when GitHub is temporarily unreachable.
+- Added a dedicated admin page that summarizes latest, outdated, Snapshot/development, newer-than-stable, and unknown Agent versions and supports search/status filtering.
+- Added direct access to the upstream Agent release page and documented the Agent's native update behavior in the UI.
+
+### Safety
+
+- Did not implement forced binary replacement through generic remote shell execution. The current Agent protocol has no dedicated update RPC, so the version manager remains inventory/status focused rather than risking cross-platform upgrade failures or stopped Agents.
+- The latest-release API result is cached for 30 minutes, and failed refreshes back off to the last known release instead of issuing a GitHub request per node or per render.
+- Agent auto-update behavior is reported accurately: upstream Agent checks at startup and every 6 hours by default unless `--disable-auto-update` is configured.
+
+### Maintenance
+
+- Added deterministic tests for Agent release parsing and metadata.
+- Added `go test ./web/rpc/jsonrpc` to pull-request CI so RPC regressions are tested directly.
+
 ## 1.5.1-asp.3 - 2026-09-17
 
 ### Added
