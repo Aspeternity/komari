@@ -7,21 +7,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-public:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-
-      - name: Test public frontend routing
-        run: go test ./web/public
-
   build-frontend:
     runs-on: ubuntu-latest
 
@@ -33,6 +18,25 @@ jobs:
         uses: ./.github/actions/build-frontend
         with:
           artifact-name: komari-frontend
+
+  test-public:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore frontend artifact
+        uses: ./.github/actions/restore-frontend
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Test public frontend routing
+        run: go test ./web/public
 
   build-binaries:
     needs: [test-public, build-frontend]
@@ -107,7 +111,6 @@ jobs:
           GIN_MODE: release
         run: |
           BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
-          # Append the appropriate executable extension based on the OS
           if [ "${{ matrix.binary_extension }}" != "" ]; then
             BINARY_NAME=${BINARY_NAME}${{ matrix.binary_extension }}
           fi
