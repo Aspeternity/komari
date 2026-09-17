@@ -2,8 +2,12 @@ package metric
 
 import (
 	"context"
-	"database/sql"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
+	"hash"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -33,12 +37,15 @@ type RollupOutlier struct {
 	MaxValue        float64   `json:"max_value"`
 }
 
-// RollupOutlierScan is a bounded preview plus exact aggregate counts.
+// RollupOutlierScan is a bounded preview plus exact aggregate counts. Fingerprint
+// commits to the complete matching bucket set, including identities and values,
+// so a destructive follow-up can fail closed if the preview has gone stale.
 type RollupOutlierScan struct {
 	TotalMatches     int64           `json:"total_matches"`
 	AffectedEntities []string        `json:"affected_entities"`
 	Preview          []RollupOutlier `json:"preview"`
 	Truncated        bool            `json:"truncated"`
+	Fingerprint      string          `json:"fingerprint"`
 }
 
 type rollupOutlierKey struct {
@@ -46,6 +53,9 @@ type rollupOutlierKey struct {
 	resolutionID int64
 	labelID      int64
 	bucketMilli  int64
+	count        int64
+	sum          float64
+	maxValue     float64
 }
 
 func (q RollupOutlierQuery) normalized() (RollupOutlierQuery, error) {
@@ -97,8 +107,51 @@ func (s *Store) rollupOutlierWhere(q RollupOutlierQuery) (string, []any) {
 	), args
 }
 
+// RollupMaintenanceSafeBefore returns the newest boundary for which every
+// configured rollup tier is guaranteed to be sealed. The largest tier matters:
+// a minute bucket can already be persisted while its 5m/hour/day parent is
+// still held in memory and could later reproduce the same anomaly. Aligning the
+// boundary to the largest tier after the coarse-rollup grace period prevents
+// historical maintenance from racing those in-memory parents.
+func (s *Store) RollupMaintenanceSafeBefore(now time.Time) time.Time {
+	now = now.UTC()
+	maxInterval := time.Minute
+	for _, tier := range s.cfg.RollupPolicy.Tiers {
+		if tier.Interval > maxInterval {
+			maxInterval = tier.Interval
+		}
+	}
+	sealedThrough := now.Add(-coarseRollupGrace)
+	boundaryMilli := bucketStartMillis(sealedThrough.UnixMilli(), maxInterval.Milliseconds())
+	return time.UnixMilli(boundaryMilli).UTC()
+}
+
+func writeOutlierHashInt64(h hash.Hash, value int64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], uint64(value))
+	_, _ = h.Write(buf[:])
+}
+
+func writeOutlierHashFloat64(h hash.Hash, value float64) {
+	writeOutlierHashInt64(h, int64(math.Float64bits(value)))
+}
+
+func writeOutlierFingerprintRow(h hash.Hash, key rollupOutlierKey) {
+	writeOutlierHashInt64(h, key.seriesID)
+	writeOutlierHashInt64(h, key.resolutionID)
+	writeOutlierHashInt64(h, key.labelID)
+	writeOutlierHashInt64(h, key.bucketMilli)
+	writeOutlierHashInt64(h, key.count)
+	writeOutlierHashFloat64(h, key.sum)
+	writeOutlierHashFloat64(h, key.maxValue)
+}
+
+func finishOutlierFingerprint(h hash.Hash) string {
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // FindRollupOutliers scans only persisted rollups. It does not inspect or
-// mutate the active raw/hot windows.
+// mutate the active raw/hot/coarse windows.
 func (s *Store) FindRollupOutliers(ctx context.Context, query RollupOutlierQuery) (RollupOutlierScan, error) {
 	if err := s.ensureOpen(); err != nil {
 		return RollupOutlierScan{}, err
@@ -114,13 +167,14 @@ func (s *Store) FindRollupOutliers(ctx context.Context, query RollupOutlierQuery
 	defer s.rollupViewMu.RUnlock()
 
 	where, args := s.rollupOutlierWhere(q)
-	sqlText := fmt.Sprintf(`SELECT s.metric_name, s.entity_id, d.resolution_milli,
+	sqlText := fmt.Sprintf(`SELECT r.series_id, r.resolution_id, r.label_id,
+		s.metric_name, s.entity_id, d.resolution_milli,
 		r.bucket_milli, r.count, r.sum, r.max_val
 		FROM %s r
 		JOIN %s s ON s.id = r.series_id
 		JOIN %s d ON d.id = r.resolution_id
 		WHERE %s
-		ORDER BY r.bucket_milli ASC, s.entity_id ASC, s.metric_name ASC, d.resolution_milli ASC`,
+		ORDER BY r.bucket_milli ASC, r.series_id ASC, r.resolution_id ASC, r.label_id ASC`,
 		s.tables.rollups, s.tables.series, s.tables.resolutions, where)
 
 	rows, err := s.reader().QueryContext(ctx, sqlText, args...)
@@ -135,21 +189,29 @@ func (s *Store) FindRollupOutliers(ctx context.Context, query RollupOutlierQuery
 	}
 	result := RollupOutlierScan{Preview: make([]RollupOutlier, 0, previewLimit)}
 	entities := make(map[string]struct{})
+	fingerprint := sha256.New()
 	for rows.Next() {
 		var item RollupOutlier
-		var bucketMilli int64
+		var key rollupOutlierKey
 		if err := rows.Scan(
+			&key.seriesID,
+			&key.resolutionID,
+			&key.labelID,
 			&item.MetricName,
 			&item.EntityID,
 			&item.ResolutionMilli,
-			&bucketMilli,
-			&item.Count,
-			&item.Sum,
-			&item.MaxValue,
+			&key.bucketMilli,
+			&key.count,
+			&key.sum,
+			&key.maxValue,
 		); err != nil {
 			return RollupOutlierScan{}, err
 		}
-		item.BucketStart = time.UnixMilli(bucketMilli).UTC()
+		item.BucketStart = time.UnixMilli(key.bucketMilli).UTC()
+		item.Count = key.count
+		item.Sum = key.sum
+		item.MaxValue = key.maxValue
+		writeOutlierFingerprintRow(fingerprint, key)
 		result.TotalMatches++
 		entities[item.EntityID] = struct{}{}
 		if len(result.Preview) < previewLimit {
@@ -159,6 +221,7 @@ func (s *Store) FindRollupOutliers(ctx context.Context, query RollupOutlierQuery
 	if err := rows.Err(); err != nil {
 		return RollupOutlierScan{}, err
 	}
+	result.Fingerprint = finishOutlierFingerprint(fingerprint)
 	result.Truncated = result.TotalMatches > int64(len(result.Preview))
 	result.AffectedEntities = make([]string, 0, len(entities))
 	for entityID := range entities {
@@ -169,9 +232,10 @@ func (s *Store) FindRollupOutliers(ctx context.Context, query RollupOutlierQuery
 }
 
 // DeleteRollupOutliers deletes only persisted rollup buckets matched by the
-// query. maxDelete is a caller supplied blast-radius guard; when it is positive
-// and the match count exceeds it, no rows are changed.
-func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQuery, maxDelete int) (int64, error) {
+// query. maxDelete is a caller supplied blast-radius guard. expectedMatches and
+// expectedFingerprint bind the mutation to an exact previously reviewed scan;
+// when either differs, no rows are changed.
+func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQuery, maxDelete int, expectedMatches int64, expectedFingerprint string) (int64, error) {
 	if err := s.ensureOpen(); err != nil {
 		return 0, err
 	}
@@ -182,10 +246,19 @@ func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQue
 	if maxDelete < 0 {
 		return 0, fmt.Errorf("%w: max delete cannot be negative", ErrInvalidArgument)
 	}
+	if expectedMatches < 0 {
+		return 0, fmt.Errorf("%w: expected match count cannot be negative", ErrInvalidArgument)
+	}
+	if strings.TrimSpace(expectedFingerprint) == "" {
+		return 0, fmt.Errorf("%w: expected fingerprint is required", ErrInvalidArgument)
+	}
+	if safe := s.RollupMaintenanceSafeBefore(time.Now().UTC()); q.Before.After(safe) {
+		return 0, fmt.Errorf("%w: cleanup boundary %s is newer than sealed rollup boundary %s", ErrInvalidArgument, q.Before.Format(time.RFC3339), safe.Format(time.RFC3339))
+	}
 
 	// Block writes/compaction while selecting and deleting exact persisted
-	// bucket identities. Callers intentionally keep Before outside the mutable
-	// raw/hot horizon, so no in-memory state needs to be rewritten here.
+	// bucket identities. The sealed boundary guarantees that matching minute
+	// samples cannot still be retained inside a mutable coarse parent.
 	s.retentionMu.Lock()
 	defer s.retentionMu.Unlock()
 	s.rollupViewMu.Lock()
@@ -198,25 +271,36 @@ func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQue
 	defer func() { _ = tx.Rollback() }()
 
 	where, args := s.rollupOutlierWhere(q)
-	selectSQL := fmt.Sprintf(`SELECT r.series_id, r.resolution_id, r.label_id, r.bucket_milli
+	selectSQL := fmt.Sprintf(`SELECT r.series_id, r.resolution_id, r.label_id,
+		r.bucket_milli, r.count, r.sum, r.max_val
 		FROM %s r
 		JOIN %s s ON s.id = r.series_id
 		JOIN %s d ON d.id = r.resolution_id
 		WHERE %s
-		ORDER BY r.bucket_milli ASC`,
+		ORDER BY r.bucket_milli ASC, r.series_id ASC, r.resolution_id ASC, r.label_id ASC`,
 		s.tables.rollups, s.tables.series, s.tables.resolutions, where)
 	rows, err := tx.QueryContext(ctx, selectSQL, args...)
 	if err != nil {
 		return 0, err
 	}
 	keys := make([]rollupOutlierKey, 0)
+	fingerprint := sha256.New()
 	for rows.Next() {
 		var key rollupOutlierKey
-		if err := rows.Scan(&key.seriesID, &key.resolutionID, &key.labelID, &key.bucketMilli); err != nil {
+		if err := rows.Scan(
+			&key.seriesID,
+			&key.resolutionID,
+			&key.labelID,
+			&key.bucketMilli,
+			&key.count,
+			&key.sum,
+			&key.maxValue,
+		); err != nil {
 			_ = rows.Close()
 			return 0, err
 		}
 		keys = append(keys, key)
+		writeOutlierFingerprintRow(fingerprint, key)
 		if maxDelete > 0 && len(keys) > maxDelete {
 			_ = rows.Close()
 			return 0, fmt.Errorf("%w: cleanup would delete %d+ rollup buckets; limit is %d", ErrInvalidArgument, len(keys), maxDelete)
@@ -228,6 +312,11 @@ func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQue
 	}
 	if err := rows.Close(); err != nil {
 		return 0, err
+	}
+
+	actualFingerprint := finishOutlierFingerprint(fingerprint)
+	if int64(len(keys)) != expectedMatches || actualFingerprint != expectedFingerprint {
+		return 0, fmt.Errorf("%w: cleanup candidate set changed after preview; scan again before cleanup", ErrInvalidArgument)
 	}
 	if len(keys) == 0 {
 		return 0, nil
@@ -253,7 +342,7 @@ func (s *Store) DeleteRollupOutliers(ctx context.Context, query RollupOutlierQue
 			return deleted, err
 		}
 		n, err := res.RowsAffected()
-		if err != nil && err != sql.ErrNoRows {
+		if err != nil {
 			return deleted, err
 		}
 		deleted += n
