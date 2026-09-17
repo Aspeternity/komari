@@ -7,9 +7,9 @@ import (
 )
 
 // reportUptimeState tracks the last reported host uptime independently from
-// the cumulative traffic baseline. The v1 implementation used uptime to avoid
-// attributing a reboot boundary to the current sampling interval; that guard
-// was lost during the v2-only protocol migration.
+// the cumulative traffic baseline. Uptime regression gives us an additional
+// signal that a large cumulative-counter jump may be a new counter domain
+// rather than real traffic.
 type reportUptimeState struct {
 	mu sync.Mutex
 
@@ -19,11 +19,12 @@ type reportUptimeState struct {
 
 var reportUptimeStates sync.Map
 
-// suppressTrafficOnUptimeRegression rebases traffic deltas when host uptime
-// moves backwards. A reboot can coincide with counters being restored from a
-// persistent source or changing to a different counter domain, so the raw
-// cumulative value may even be larger than the previous sample. Treating that
-// boundary as traffic can create TB/PB-scale spikes.
+// suppressTrafficOnUptimeRegression rejects only implausibly large traffic
+// deltas at a host-restart boundary. Small deltas are preserved because some
+// counter sources survive a reboot and can legitimately continue increasing.
+// A reboot combined with a restored or changed counter domain can instead make
+// the new cumulative value numerically much larger than the previous sample;
+// without this guard that discontinuity becomes a TB/PB-scale history spike.
 func suppressTrafficOnUptimeRegression(report v2.Report, trafficUp, trafficDown int64) (int64, int64) {
 	if report.UUID == "" || report.Uptime < 0 {
 		return trafficUp, trafficDown
@@ -37,8 +38,14 @@ func suppressTrafficOnUptimeRegression(report v2.Report, trafficUp, trafficDown 
 	state.uptime = report.Uptime
 	state.mu.Unlock()
 
-	if restarted {
-		return 0, 0
+	if !restarted {
+		return trafficUp, trafficDown
+	}
+	if trafficUp > maxResetAwareDelta {
+		trafficUp = 0
+	}
+	if trafficDown > maxResetAwareDelta {
+		trafficDown = 0
 	}
 	return trafficUp, trafficDown
 }
