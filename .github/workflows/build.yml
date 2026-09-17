@@ -48,6 +48,9 @@ jobs:
       - name: Test metric storage engine
         run: go test ./pkg/metric
 
+      - name: Test RPC regressions
+        run: go test ./web/rpc/jsonrpc
+
   build-binaries:
     needs: [test-public, build-frontend]
     runs-on: ubuntu-latest
