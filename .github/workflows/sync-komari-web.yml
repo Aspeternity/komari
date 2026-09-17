@@ -105,5 +105,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: sync komari-web ${FRONTEND_SHA:0:12}"
+          git commit -m "chore: sync komari-web ${FRONTEND_SHA:0:12} [skip ci]"
           git push origin HEAD:main

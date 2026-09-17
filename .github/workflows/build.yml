@@ -6,22 +6,11 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: build-pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test-public:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25"
-
-      - name: Test public frontend routing
-        run: go test ./web/public
-
   build-frontend:
     runs-on: ubuntu-latest
 
@@ -34,6 +23,25 @@ jobs:
         with:
           artifact-name: komari-frontend
 
+  test-public:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore frontend artifact
+        uses: ./.github/actions/restore-frontend
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Test public frontend routing
+        run: go test ./web/public
+
   build-binaries:
     needs: [test-public, build-frontend]
     runs-on: ubuntu-latest
@@ -43,7 +51,6 @@ jobs:
         goos: [windows, linux]
         goarch: [amd64, arm64, 386, riscv64]
         include:
-          # Windows
           - goos: windows
             goarch: amd64
             zig_target_triple: x86_64-windows-gnu
@@ -56,8 +63,6 @@ jobs:
             goarch: 386
             zig_target_triple: x86-windows-gnu
             binary_extension: .exe
-
-          # Linux
           - goos: linux
             goarch: amd64
             zig_target_triple: x86_64-linux-musl
@@ -78,7 +83,6 @@ jobs:
             goarch: loong64
             zig_target_triple: loongarch64-linux-musl
             binary_extension: ""
-
         exclude:
           - goos: windows
             goarch: riscv64
@@ -107,7 +111,6 @@ jobs:
           GIN_MODE: release
         run: |
           BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
-          # Append the appropriate executable extension based on the OS
           if [ "${{ matrix.binary_extension }}" != "" ]; then
             BINARY_NAME=${BINARY_NAME}${{ matrix.binary_extension }}
           fi
